@@ -216,12 +216,278 @@ float vector_get_intensity(void)
 	return intensity_correction;
 }
 
+// Serial port things
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <termios.h>
+#include <inttypes.h>
+#include <sys/time.h>
+#include <stdint.h>
+#include <errno.h>
+
+static const char * m_serial;
+static int m_serial_fd;
+static float m_serial_scale;
+static int m_serial_rotate;
+static int m_serial_bright = 170;
+static int m_serial_drop_frame;
+static unsigned m_vector_transit[3];
+static size_t m_serial_offset;
+static uint8_t m_serial_buf[32768];
+
+static int
+serial_open(
+        const char * const dev
+)
+{
+        const int fd = open(dev, O_RDWR | O_NONBLOCK | O_NOCTTY, 0666);
+        if (fd < 0)
+                return -1;
+
+        // Disable modem control signals
+        struct termios attr;
+        tcgetattr(fd, &attr);
+        attr.c_cflag |= CLOCAL | CREAD;
+        attr.c_oflag &= ~OPOST;
+        tcsetattr(fd, TCSANOW, &attr);
+
+        return fd;
+}
+
+static void serial_draw_point(
+	int x,
+	int y,
+	int intensity
+)
+{
+	static int last_intensity;
+
+	// scale to area; keep in mind these are fixed point with 16-bits on the right side
+	// we want to scale it to 0-2047, so that is .  we could use the clipping, but
+	// skip it for now and just use the visible area.
+
+	const int x_offset = Machine->visible_area.min_x;
+	const int x_scale = Machine->visible_area.max_x - x_offset;
+	const int y_offset = Machine->visible_area.min_y;
+	const int y_scale = Machine->visible_area.max_y - y_offset;
+	x = (x - x_offset * 65536) / x_scale / 32;
+	y = (y - y_offset * 65536) / y_scale / 32;
+
+	//printf("%d,%d -> %d,%d : %d,%d,%d\n", xmin, ymin, xmax, ymax, x, y, intensity);
+
+	// always flip the Y, since the vectorscope measures
+	// 0,0 at the bottom left corner, but this coord uses
+	// the top left corner.
+	y = 2047 - y;
+
+	// make sure that we are in range; should always be
+	// due to clipping on the window, but just in case
+	if (x < 0) x = 0;
+	if (y < 0) y = 0;
+
+	if (x > 2047) x = 2047;
+	if (y > 2047) y = 2047;
+
+	unsigned bright;
+	if (intensity > m_serial_bright)
+		bright = 3;
+	else
+	if (intensity > 0)
+		bright = 2;
+	else
+		bright = 1;
+
+	if (m_serial_rotate == 1)
+	{
+		// +90
+		unsigned tmp = x;
+		x = 2047 - y;
+		y = tmp;
+	} else
+	if (m_serial_rotate == 2)
+	{
+		// +180
+		x = 2047 - x;
+		y = 2047 - y;
+	} else
+	if (m_serial_rotate == 3)
+	{
+		// -90
+		unsigned t = x;
+		x = y;
+		y = 2047 - t;
+	}
+
+	uint32_t cmd = 0
+		| (bright << 22)
+		| (x & 0x7FF) << 11
+		| (y & 0x7FF) <<  0
+		;
+
+	if (intensity == 0 && last_intensity == 0 && m_serial_offset > 4)
+	{
+		// ignore duplicate transit commands
+		// by over-writing the old transit
+		m_serial_offset -= 3;
+	}
+	last_intensity = intensity;
+
+	m_serial_buf[m_serial_offset++] = cmd >> 16;
+	m_serial_buf[m_serial_offset++] = cmd >>  8;
+	m_serial_buf[m_serial_offset++] = cmd >>  0;
+
+	// todo: check for overflow;
+	// should always have enough points
+}
+
+
+#if 0
+static void serial_draw_line(
+	int xf0,
+	int yf0,
+	int xf1,
+	int yf1,
+	int intensity
+)
+{
+	printf("%d,%d %d,%d\n", xf0, yf0, xf1, yf1);
+
+	if (m_serial_fd < 0)
+		return;
+
+	static int last_x;
+	static int last_y;
+
+	const int x0 = (xf0 * 2048 - 1024) * m_serial_scale + 1024;
+	const int y0 = (yf0 * 2048 - 1024) * m_serial_scale + 1024;
+	const int x1 = (xf1 * 2048 - 1024) * m_serial_scale + 1024;
+	const int y1 = (yf1 * 2048 - 1024) * m_serial_scale + 1024;
+
+	// if this is not a continuous segment,
+	// we must add a transit command
+	if (last_x != x0 || last_y != y0)
+	{
+		serial_draw_point(x0, y0, 0);
+		int dx = x0 - last_x;
+		int dy = y0 - last_y;
+		m_vector_transit[0] += sqrt(dx*dx + dy*dy);
+	}
+
+	// transit to the new point
+	int dx = x1 - x0;
+	int dy = y1 - y0;
+	int dist = sqrt(dx*dx + dy*dy);
+
+	serial_draw_point(x1, y1, intensity);
+	if (intensity > m_serial_bright)
+		m_vector_transit[2] += dist;
+	else
+		m_vector_transit[1] += dist;
+
+	last_x = x1;
+	last_y = y1;
+}
+#endif
+
+
+static void serial_reset()
+{
+	m_serial_offset = 0;
+	m_serial_buf[m_serial_offset++] = 0;
+	m_serial_buf[m_serial_offset++] = 0;
+	m_serial_buf[m_serial_offset++] = 0;
+	m_serial_buf[m_serial_offset++] = 0;
+
+	m_vector_transit[0] = 0;
+	m_vector_transit[1] = 0;
+	m_vector_transit[2] = 0;
+}
+
+
+static void serial_send()
+{
+	if (m_serial_fd < 0)
+		return;
+
+	// add the "done" command to the message
+	m_serial_buf[m_serial_offset++] = 1;
+	m_serial_buf[m_serial_offset++] = 1;
+	m_serial_buf[m_serial_offset++] = 1;
+
+	size_t offset = 0;
+
+	printf("%zu vectors: off=%u on=%u bright=%u%s\n",
+		m_serial_offset/3,
+		m_vector_transit[0],
+		m_vector_transit[1],
+		m_vector_transit[2],
+		m_serial_drop_frame ? " !" : ""
+	);
+
+	if (m_serial_drop_frame)
+	{
+		// we skipped a frame, don't skip the next one
+		m_serial_drop_frame = 0;
+	} else
+	while (offset < m_serial_offset)
+	{
+		ssize_t rc = write(m_serial_fd, m_serial_buf + offset, m_serial_offset - offset);
+		if (rc <= 0)
+		{
+			m_serial_drop_frame = 1;
+			if (errno == EAGAIN)
+				continue;
+			perror(m_serial);
+			close(m_serial_fd);
+			m_serial_fd = -1;
+			break;
+		}
+
+		offset += rc;
+	}
+
+	serial_reset();
+}
+
+static void serial_start(void)
+{
+	m_serial = getenv("VECTOR_SERIAL");
+
+	if (m_serial == NULL)
+		m_serial = "/dev/ttyACM0";
+	m_serial_fd = serial_open(m_serial);
+	fprintf(stderr, "%s: fd=%d\n", m_serial, m_serial_fd);
+	if (m_serial_fd < 0)
+	{
+		perror(m_serial);
+	}
+
+	const char * threshold_string = getenv("VECTOR_BRIGHT");
+	if (threshold_string)
+		m_serial_bright = atoi(threshold_string);
+
+	const char * rotate_string = getenv("VECTOR_ROTATE");
+	if (rotate_string)
+		m_serial_rotate = atoi(rotate_string);
+
+	const char * scale_string = getenv("VECTOR_SCALE");
+	if (scale_string)
+		m_serial_scale = atof(scale_string);
+
+	serial_reset();
+}
+
+
 /*
  * Initializes vector game video emulation
  */
 
 int vector_vh_start (void)
 {
+	serial_start();
+
 	int h,i,j,k,c[3];
 
 	/* Grab the settings for this session */
@@ -458,6 +724,9 @@ void vector_draw_to (int x2, int y2, int col, int intensity, int dirty)
 		x2 = ((vecwidth-1)<<16)-x2;
 	if (orientation & ORIENTATION_FLIP_Y)
 		y2 = ((vecheight-1)<<16)-y2;
+
+	// [2.5] send the vectors to the hardware display
+	serial_draw_point(x2, y2, intensity);
 
 	/* [3] adjust cords if needed */
 
@@ -871,6 +1140,8 @@ void vector_vh_update(struct osd_bitmap *bitmap,int full_refresh)
 		}
 		_new++;
 	}
+
+	serial_send();
 }
 
 /*********************************************************************
