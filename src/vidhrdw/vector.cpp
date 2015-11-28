@@ -256,6 +256,11 @@ serial_open(
         return fd;
 }
 
+static int x_offset;
+static int x_scale;
+static int y_offset;
+static int y_scale;
+
 static void serial_draw_point(
 	int x,
 	int y,
@@ -268,12 +273,20 @@ static void serial_draw_point(
 	// we want to scale it to 0-2047, so that is .  we could use the clipping, but
 	// skip it for now and just use the visible area.
 
+#if 0
 	const int x_offset = Machine->visible_area.min_x;
 	const int x_scale = Machine->visible_area.max_x - x_offset;
 	const int y_offset = Machine->visible_area.min_y;
 	const int y_scale = Machine->visible_area.max_y - y_offset;
+#else
+#endif
+
 	x = (x - x_offset * 65536) / x_scale / 32;
 	y = (y - y_offset * 65536) / y_scale / 32;
+
+	// scale it
+	x = (x - 1024) * m_serial_scale + 1024;
+	y = (y - 1024) * m_serial_scale + 1024;
 
 	//printf("%d,%d -> %d,%d : %d,%d,%d\n", xmin, ymin, xmax, ymax, x, y, intensity);
 
@@ -926,6 +939,8 @@ void vector_set_clip (int x1, int yy1, int x2, int y2)
 	int orientation;
 	int tmp;
 
+printf("clip %d,%d %d,%d\n", x1>>16, yy1>>16, x2>>16, y2>>16);
+
 	/* failsafe */
 	if ((x1 >= x2) || (yy1 >= y2))
 	{
@@ -1112,6 +1127,17 @@ void vector_vh_update(struct osd_bitmap *bitmap,int full_refresh)
 	}
 	/* reset clipping area */
 	xmin = 0; xmax = vecwidth; ymin = 0; ymax = vecheight;
+
+printf("default clip %d,%d %d,%d\n", xmin, ymin, xmax, ymax);
+printf("vis area %d,%d %d,%d\n",
+	Machine->visible_area.max_x, Machine->visible_area.min_x,
+	Machine->visible_area.max_y, Machine->visible_area.min_y);
+
+	x_offset = xmin;
+	x_scale = xmax - xmin;
+	y_offset = ymin;
+	y_scale = ymax - ymin;
+
 
 	/* next call to vector_clear_list() is allowed to swap the lists */
 	vector_runs = 0;
