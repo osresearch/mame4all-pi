@@ -229,7 +229,7 @@ float vector_get_intensity(void)
 
 static const char * m_serial;
 static int m_serial_fd;
-static float m_serial_scale;
+static float m_serial_scale = 1.0;
 static int m_serial_rotate;
 static int m_serial_bright = 170;
 static int m_serial_drop_frame;
@@ -270,7 +270,7 @@ static void serial_draw_point(
 	static int last_intensity;
 
 	// scale to area; keep in mind these are fixed point with 16-bits on the right side
-	// we want to scale it to 0-2047, so that is .  we could use the clipping, but
+	// we want to scale it to 0-4095, so that is .  we could use the clipping, but
 	// skip it for now and just use the visible area.
 
 #if 0
@@ -281,72 +281,77 @@ static void serial_draw_point(
 #else
 #endif
 
-	x = (x - x_offset * 65536) / x_scale / 32;
-	y = (y - y_offset * 65536) / y_scale / 32;
+	x = (x - x_offset * 65536) / x_scale / 16;
+	y = (y - y_offset * 65536) / y_scale / 16;
 
 	// scale it
-	x = (x - 1024) * m_serial_scale + 1024;
-	y = (y - 1024) * m_serial_scale + 1024;
+	x = (x - 2048) * m_serial_scale + 2048;
+	y = (y - 2048) * m_serial_scale + 2048;
 
 	//printf("%d,%d -> %d,%d : %d,%d,%d\n", xmin, ymin, xmax, ymax, x, y, intensity);
 
 	// always flip the Y, since the vectorscope measures
 	// 0,0 at the bottom left corner, but this coord uses
 	// the top left corner.
-	y = 2047 - y;
+	y = 4095 - y;
 
 	// make sure that we are in range; should always be
 	// due to clipping on the window, but just in case
 	if (x < 0) x = 0;
 	if (y < 0) y = 0;
 
-	if (x > 2047) x = 2047;
-	if (y > 2047) y = 2047;
+	if (x > 4095) x = 4095;
+	if (y > 4095) y = 4095;
 
 	unsigned bright;
 	if (intensity > m_serial_bright)
-		bright = 3;
+		bright = 63;
 	else
 	if (intensity > 0)
-		bright = 2;
+		bright = intensity / 8;
 	else
-		bright = 1;
+		bright = 0;
+
+	bright &= 63;
 
 	if (m_serial_rotate == 1)
 	{
 		// +90
 		unsigned tmp = x;
-		x = 2047 - y;
+		x = 4095 - y;
 		y = tmp;
 	} else
 	if (m_serial_rotate == 2)
 	{
 		// +180
-		x = 2047 - x;
-		y = 2047 - y;
+		x = 4095 - x;
+		y = 4095 - y;
 	} else
 	if (m_serial_rotate == 3)
 	{
 		// -90
 		unsigned t = x;
 		x = y;
-		y = 2047 - t;
+		y = 4095 - t;
 	}
 
 	uint32_t cmd = 0
-		| (bright << 22)
-		| (x & 0x7FF) << 11
-		| (y & 0x7FF) <<  0
+		| (2 << 30)
+		| (bright & 63) << 24
+		| (x & 0xFFF) << 12
+		| (y & 0xFFF) <<  0
 		;
 
 	if (intensity == 0 && last_intensity == 0 && m_serial_offset > 4)
 	{
 		// ignore duplicate transit commands
 		// by over-writing the old transit
-		m_serial_offset -= 3;
+		m_serial_offset -= 4;
 	}
 	last_intensity = intensity;
 
+//printf("%d %d %d\n", x, y, intensity);
+	m_serial_buf[m_serial_offset++] = cmd >> 24;
 	m_serial_buf[m_serial_offset++] = cmd >> 16;
 	m_serial_buf[m_serial_offset++] = cmd >>  8;
 	m_serial_buf[m_serial_offset++] = cmd >>  0;
@@ -356,58 +361,15 @@ static void serial_draw_point(
 }
 
 
-#if 0
-static void serial_draw_line(
-	int xf0,
-	int yf0,
-	int xf1,
-	int yf1,
-	int intensity
-)
-{
-	printf("%d,%d %d,%d\n", xf0, yf0, xf1, yf1);
-
-	if (m_serial_fd < 0)
-		return;
-
-	static int last_x;
-	static int last_y;
-
-	const int x0 = (xf0 * 2048 - 1024) * m_serial_scale + 1024;
-	const int y0 = (yf0 * 2048 - 1024) * m_serial_scale + 1024;
-	const int x1 = (xf1 * 2048 - 1024) * m_serial_scale + 1024;
-	const int y1 = (yf1 * 2048 - 1024) * m_serial_scale + 1024;
-
-	// if this is not a continuous segment,
-	// we must add a transit command
-	if (last_x != x0 || last_y != y0)
-	{
-		serial_draw_point(x0, y0, 0);
-		int dx = x0 - last_x;
-		int dy = y0 - last_y;
-		m_vector_transit[0] += sqrt(dx*dx + dy*dy);
-	}
-
-	// transit to the new point
-	int dx = x1 - x0;
-	int dy = y1 - y0;
-	int dist = sqrt(dx*dx + dy*dy);
-
-	serial_draw_point(x1, y1, intensity);
-	if (intensity > m_serial_bright)
-		m_vector_transit[2] += dist;
-	else
-		m_vector_transit[1] += dist;
-
-	last_x = x1;
-	last_y = y1;
-}
-#endif
-
 
 static void serial_reset()
 {
 	m_serial_offset = 0;
+	m_serial_buf[m_serial_offset++] = 0;
+	m_serial_buf[m_serial_offset++] = 0;
+	m_serial_buf[m_serial_offset++] = 0;
+	m_serial_buf[m_serial_offset++] = 0;
+
 	m_serial_buf[m_serial_offset++] = 0;
 	m_serial_buf[m_serial_offset++] = 0;
 	m_serial_buf[m_serial_offset++] = 0;
@@ -425,6 +387,7 @@ static void serial_send()
 		return;
 
 	// add the "done" command to the message
+	m_serial_buf[m_serial_offset++] = 1;
 	m_serial_buf[m_serial_offset++] = 1;
 	m_serial_buf[m_serial_offset++] = 1;
 	m_serial_buf[m_serial_offset++] = 1;
@@ -1128,10 +1091,12 @@ void vector_vh_update(struct osd_bitmap *bitmap,int full_refresh)
 	/* reset clipping area */
 	xmin = 0; xmax = vecwidth; ymin = 0; ymax = vecheight;
 
+/*
 printf("default clip %d,%d %d,%d\n", xmin, ymin, xmax, ymax);
 printf("vis area %d,%d %d,%d\n",
 	Machine->visible_area.max_x, Machine->visible_area.min_x,
 	Machine->visible_area.max_y, Machine->visible_area.min_y);
+*/
 
 	x_offset = xmin;
 	x_scale = xmax - xmin;
